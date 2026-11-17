@@ -49,6 +49,25 @@ echo "$TRACE" | pretty
 TRACE_ID=$(echo "$TRACE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["trace_id"])')
 
 echo
+echo "== reverse attribution: minimum candidate sources for the positives =="
+REVERSE_BEFORE=$(curl -fsS -X POST "$API/reverse-traces" -H 'Content-Type: application/json' \
+  -d "{
+    \"candidate_sample_ids\": [\"S${RUN}-001\", \"S${RUN}-006\"],
+    \"positive_sample_ids\": [\"S${RUN}-003\"]
+  }")
+echo "$REVERSE_BEFORE" | pretty
+REVERSE_ID=$(echo "$REVERSE_BEFORE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["reverse_trace_id"])')
+
+echo
+echo "== reverse attribution blocked by a reviewed negative sample =="
+curl -fsS -X POST "$API/reverse-traces" -H 'Content-Type: application/json' \
+  -d "{
+    \"candidate_sample_ids\": [\"S${RUN}-001\"],
+    \"positive_sample_ids\": [\"S${RUN}-003\"],
+    \"negative_sample_ids\": [\"S${RUN}-002\"]
+  }" | pretty
+
+echo
 echo "== correct B${RUN}-1002 (client saw version 1): Reference-Lab -> Cold-Room =="
 curl -fsS -X POST "$API/batches/B${RUN}-1002/corrections" \
   -H 'Content-Type: application/json' \
@@ -61,12 +80,25 @@ curl -fsS -X POST "$API/batches/B${RUN}-1002/corrections" \
   }' | pretty
 
 echo
-echo "== the old snapshot is now invalid =="
+echo "== the old forward snapshot is now invalid =="
 curl -sS -o "$WORK/old.json" -w 'HTTP %{http_code}\n' "$API/traces/$TRACE_ID"
 pretty <"$WORK/old.json" || cat "$WORK/old.json"
 
 echo
-echo "== a fresh trace reflects the corrected batch =="
+echo "== the old reverse attribution is invalidated by the same correction =="
+curl -sS -o "$WORK/old-reverse.json" -w 'HTTP %{http_code}\n' "$API/reverse-traces/$REVERSE_ID"
+pretty <"$WORK/old-reverse.json" || cat "$WORK/old-reverse.json"
+
+echo
+echo "== a fresh reverse trace reflects the corrected batch =="
+curl -fsS -X POST "$API/reverse-traces" -H 'Content-Type: application/json' \
+  -d "{
+    \"candidate_sample_ids\": [\"S${RUN}-001\", \"S${RUN}-006\"],
+    \"positive_sample_ids\": [\"S${RUN}-003\"]
+  }" | pretty
+
+echo
+echo "== a fresh forward trace reflects the corrected batch =="
 curl -fsS -X POST "$API/traces" -H 'Content-Type: application/json' -d '{}' | pretty
 
 echo

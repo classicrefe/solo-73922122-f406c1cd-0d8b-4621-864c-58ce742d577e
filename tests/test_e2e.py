@@ -163,3 +163,106 @@ def test_end_to_end_errors_are_structured(server):
         )
         assert bad.status_code == 422
         assert bad.json()["code"] == "validation_error"
+
+
+def test_reverse_trace_end_to_end_over_http(server):
+    with httpx.Client(base_url=server, timeout=10) as http:
+        intake = http.post(
+            "/intakes",
+            json={
+                "source_sample_ids": [],
+                "samples": [
+                    {"sample_id": "C1", "batch_nos": ["B1"]},
+                    {"sample_id": "C2", "batch_nos": ["B3"]},
+                    {"sample_id": "P1", "batch_nos": ["B2"]},
+                    {"sample_id": "P2", "batch_nos": ["B4"]},
+                    {"sample_id": "N1", "batch_nos": ["B5"]},
+                ],
+                "batches": [
+                    {
+                        "batch_no": "B1", "origin": "s1", "destination": "hub",
+                        "departed_at": "2026-01-01T00:00:00Z",
+                        "arrived_at": "2026-01-01T01:00:00Z",
+                    },
+                    {
+                        "batch_no": "B2", "origin": "hub", "destination": "lab",
+                        "departed_at": "2026-01-01T02:00:00Z",
+                        "arrived_at": "2026-01-01T03:00:00Z",
+                    },
+                    {
+                        "batch_no": "B3", "origin": "s2", "destination": "hub2",
+                        "departed_at": "2026-01-01T00:00:00Z",
+                        "arrived_at": "2026-01-01T01:00:00Z",
+                    },
+                    {
+                        "batch_no": "B4", "origin": "hub2", "destination": "lab",
+                        "departed_at": "2026-01-01T02:00:00Z",
+                        "arrived_at": "2026-01-01T04:00:00Z",
+                    },
+                    {
+                        "batch_no": "B5", "origin": "hub", "destination": "store",
+                        "departed_at": "2026-01-01T02:00:00Z",
+                        "arrived_at": "2026-01-01T03:30:00Z",
+                    },
+                ],
+            },
+        )
+        assert intake.status_code == 201, intake.text
+
+        # Solvable: both candidates are needed, C1's chain reaches N1 but N1 is
+        # not declared negative yet, so the combination stands.
+        result = http.post(
+            "/reverse-traces",
+            json={
+                "candidate_sample_ids": ["C1", "C2"],
+                "positive_sample_ids": ["P1", "P2"],
+            },
+        )
+        assert result.status_code == 201, result.text
+        body = result.json()
+        assert body["solvable"] is True
+        assert body["minimum_source_count"] == 2
+        rid = body["reverse_trace_id"]
+        assert http.get(f"/reverse-traces/{rid}").status_code == 200
+
+        # Negative constraint: C1 reaches N1, so no valid combination remains.
+        blocked = http.post(
+            "/reverse-traces",
+            json={
+                "candidate_sample_ids": ["C1"],
+                "positive_sample_ids": ["P1"],
+                "negative_sample_ids": ["N1"],
+            },
+        )
+        assert blocked.status_code == 201
+        assert blocked.json()["solvable"] is False
+        assert blocked.json()["reason_code"] == "all_combinations_touch_negative"
+
+        # Correction interleaving: the first snapshot must refuse stale advice.
+        correction = http.post(
+            "/batches/B2/corrections",
+            json={
+                "seen_version": 1,
+                "origin": "hub",
+                "destination": "lab",
+                "departed_at": "2026-01-02T02:00:00Z",
+                "arrived_at": "2026-01-02T03:00:00Z",
+            },
+        )
+        assert correction.status_code == 200
+        stale = http.get(f"/reverse-traces/{rid}")
+        assert stale.status_code == 409
+        assert stale.json()["code"] == "snapshot_invalidated"
+
+        fresh = http.post(
+            "/reverse-traces",
+            json={
+                "candidate_sample_ids": ["C1", "C2"],
+                "positive_sample_ids": ["P1", "P2"],
+            },
+        )
+        assert fresh.status_code == 201
+        fresh_body = fresh.json()
+        assert fresh_body["solvable"] is False
+        assert fresh_body["reason_code"] == "unexplained_positive_samples"
+        assert fresh_body["snapshot"]["batch_versions"]["B2"] == 2

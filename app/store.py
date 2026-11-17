@@ -12,8 +12,14 @@ live batch version are recorded. The result rows and the ``complete`` flag are
 written in one transaction, so a reader never observes a partially published
 result; a failure leaves zero result rows.
 
-*Invalidation*: a correction marks every completed trace that pinned the
-superseded version. Reading such a trace returns 409 instead of stale data.
+*A reverse trace* is the same snapshot mechanism for reverse attribution. Its
+minimum-source combination rows are published atomically in their own tables
+(``reverse_traces`` / ``reverse_combos``), so a failed reverse query leaves no
+partial advice and never touches the forward-trace tables or source flags.
+
+*Invalidation*: a correction marks every completed trace (forward or reverse)
+that pinned the superseded version. Reading such a trace returns 409 instead
+of stale data.
 """
 from __future__ import annotations
 
@@ -99,6 +105,41 @@ CREATE TABLE IF NOT EXISTS trace_invalidations (
     invalidated_at TEXT NOT NULL,
     reason         TEXT NOT NULL,
     PRIMARY KEY (trace_id, batch_no, version)
+);
+
+CREATE TABLE IF NOT EXISTS reverse_traces (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    intake_id    INTEGER NOT NULL REFERENCES intakes(id),
+    status       TEXT NOT NULL CHECK (status IN ('pending', 'complete', 'failed')),
+    accepted_at  TEXT NOT NULL,
+    completed_at TEXT,
+    error        TEXT,
+    candidates_json TEXT NOT NULL,
+    positives_json  TEXT NOT NULL,
+    negatives_json  TEXT NOT NULL,
+    solvable     INTEGER,
+    reason_code  TEXT,
+    reason       TEXT,
+    reason_details_json TEXT,
+    minimum_source_count INTEGER,
+    pinned_json  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS reverse_combos (
+    reverse_trace_id INTEGER NOT NULL REFERENCES reverse_traces(id) ON DELETE CASCADE,
+    rank             INTEGER NOT NULL,
+    source_sample_ids_json TEXT NOT NULL,
+    explanations_json TEXT NOT NULL,
+    PRIMARY KEY (reverse_trace_id, rank)
+);
+
+CREATE TABLE IF NOT EXISTS reverse_invalidations (
+    reverse_trace_id INTEGER NOT NULL REFERENCES reverse_traces(id) ON DELETE CASCADE,
+    batch_no       TEXT NOT NULL,
+    version        INTEGER NOT NULL,
+    invalidated_at TEXT NOT NULL,
+    reason         TEXT NOT NULL,
+    PRIMARY KEY (reverse_trace_id, batch_no, version)
 );
 
 CREATE TABLE IF NOT EXISTS request_log (
@@ -237,7 +278,12 @@ class Store:
                 " error=? WHERE status='pending' AND accepted_at<?",
                 (iso(utcnow()), "interrupted before completion", cutoff),
             )
-            return cur.rowcount
+            reverse = conn.execute(
+                "UPDATE reverse_traces SET status='failed', completed_at=?,"
+                " error=? WHERE status='pending' AND accepted_at<?",
+                (iso(utcnow()), "interrupted before completion", cutoff),
+            )
+            return cur.rowcount + reverse.rowcount
 
     # ----------------------------------------------------------------- intake
 
@@ -535,6 +581,21 @@ class Store:
                     " VALUES (?, ?, ?, ?, ?)",
                     (trace_id, batch_no, version, now, reason),
                 )
+
+            reverse_rows = conn.execute(
+                "SELECT t.id FROM reverse_traces t, json_each(t.pinned_json) e"
+                " WHERE t.intake_id=? AND t.status='complete'"
+                " AND e.key=? AND CAST(e.value AS INTEGER)=?",
+                (intake_id, batch_no, version),
+            ).fetchall()
+            invalidated_reverse = sorted(int(row["id"]) for row in reverse_rows)
+            for reverse_trace_id in invalidated_reverse:
+                conn.execute(
+                    "INSERT OR IGNORE INTO reverse_invalidations(reverse_trace_id,"
+                    " batch_no, version, invalidated_at, reason)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (reverse_trace_id, batch_no, version, now, reason),
+                )
             return {
                 "batch_no": batch_no,
                 "previous_version": version,
@@ -815,6 +876,241 @@ class Store:
                 " (SELECT COUNT(*) FROM trace_invalidations i"
                 "   WHERE i.trace_id=t.id) AS invalidation_count"
                 " FROM traces t ORDER BY t.id DESC"
+            ).fetchall()
+
+    # -------------------------------------------------------- reverse traces
+
+    def accept_reverse_trace(
+        self,
+        *,
+        candidates: list[str],
+        positives: list[str],
+        negatives: list[str],
+    ) -> tuple[int, dict[str, Any]]:
+        """Pin a snapshot and register a pending reverse attribution query.
+
+        Mirrors :meth:`accept_trace`: snapshot read and the ``pending`` insert
+        happen in one ``BEGIN IMMEDIATE`` transaction, so the pinned versions
+        can never drift from the data the computation uses.
+
+        Raises:
+            NotFoundError: no active dataset.
+            InvalidReferenceError: a referenced sample is unknown.
+        """
+        with self.transaction() as conn:
+            snapshot = self._snapshot_in(conn)
+            if snapshot is None:
+                raise NotFoundError("no dataset")
+            referenced = set(candidates) | set(positives) | set(negatives)
+            unknown = sorted(referenced - set(snapshot["all_sample_ids"]))
+            if unknown:
+                raise InvalidReferenceError(
+                    f"unknown sample(s): {', '.join(unknown)}"
+                )
+
+            cur = conn.execute(
+                "INSERT INTO reverse_traces(intake_id, status, accepted_at,"
+                " candidates_json, positives_json, negatives_json, pinned_json)"
+                " VALUES (?, 'pending', ?, ?, ?, ?, ?)",
+                (
+                    snapshot["intake_id"],
+                    iso(utcnow()),
+                    json.dumps(candidates),
+                    json.dumps(positives),
+                    json.dumps(negatives),
+                    json.dumps(snapshot["pinned"], sort_keys=True),
+                ),
+            )
+            return int(cur.lastrowid), snapshot
+
+    def publish_reverse_results(
+        self,
+        reverse_trace_id: int,
+        outcome: dict[str, Any],
+        *,
+        pinned: dict[str, int],
+    ) -> None:
+        """Publish every combination row and the complete flag atomically.
+
+        Refuses if a pinned batch version changed while the computation ran,
+        so stale advice is never returned.
+        """
+        now = iso(utcnow())
+        with self.transaction() as conn:
+            trace = conn.execute(
+                "SELECT status FROM reverse_traces WHERE id=?",
+                (reverse_trace_id,),
+            ).fetchone()
+            if trace is None:
+                raise NotFoundError("reverse trace not found")
+            if trace["status"] != "pending":
+                raise ConflictError(
+                    f"reverse trace {reverse_trace_id} is {trace['status']},"
+                    " not pending"
+                )
+            live = {
+                row["batch_no"]: int(row["version"])
+                for row in conn.execute(
+                    "SELECT batch_no, version FROM batches"
+                    " WHERE intake_id=(SELECT intake_id FROM reverse_traces"
+                    " WHERE id=?) AND superseded=0",
+                    (reverse_trace_id,),
+                ).fetchall()
+            }
+            changed = sorted(
+                batch_no
+                for batch_no, version in pinned.items()
+                if live.get(batch_no) != version
+            )
+            if changed:
+                raise ConflictError(
+                    "snapshot went stale during computation:"
+                    f" {', '.join(changed)}"
+                )
+
+            minimum = (
+                len(outcome["combinations"][0]["source_sample_ids"])
+                if outcome["combinations"]
+                else None
+            )
+            conn.execute(
+                "UPDATE reverse_traces SET status='complete', completed_at=?,"
+                " error=NULL, solvable=?, reason_code=?, reason=?,"
+                " reason_details_json=?, minimum_source_count=? WHERE id=?",
+                (
+                    now,
+                    int(bool(outcome["solvable"])),
+                    outcome["reason_code"],
+                    outcome["reason"],
+                    json.dumps(outcome["reason_details"], sort_keys=True)
+                    if outcome["reason_details"] is not None
+                    else None,
+                    minimum,
+                    reverse_trace_id,
+                ),
+            )
+            for rank, combo in enumerate(outcome["combinations"]):
+                conn.execute(
+                    "INSERT INTO reverse_combos(reverse_trace_id, rank,"
+                    " source_sample_ids_json, explanations_json)"
+                    " VALUES (?, ?, ?, ?)",
+                    (
+                        reverse_trace_id,
+                        rank,
+                        json.dumps(combo["source_sample_ids"]),
+                        json.dumps(
+                            [
+                                {
+                                    "sample_id": item["sample_id"],
+                                    "source_sample_id": item["source_sample_id"],
+                                    "first_arrival_at": (
+                                        iso(item["first_arrival_at"])
+                                        if item["first_arrival_at"] is not None
+                                        else None
+                                    ),
+                                    "path": [
+                                        {
+                                            "batch_no": leg["batch_no"],
+                                            "origin": leg["origin"],
+                                            "destination": leg["destination"],
+                                            "departed_at": iso(leg["departed_at"]),
+                                            "arrived_at": iso(leg["arrived_at"]),
+                                            "version": int(leg["version"]),
+                                        }
+                                        for leg in item["path"]
+                                    ],
+                                }
+                                for item in combo["explanations"]
+                            ]
+                        ),
+                    ),
+                )
+
+    def fail_reverse_trace(self, reverse_trace_id: int, error: str) -> None:
+        """Delete any partial combination rows and record the failure."""
+        with self.transaction() as conn:
+            conn.execute(
+                "DELETE FROM reverse_combos WHERE reverse_trace_id=?",
+                (reverse_trace_id,),
+            )
+            conn.execute(
+                "UPDATE reverse_traces SET status='failed', completed_at=?,"
+                " error=? WHERE id=? AND status='pending'",
+                (iso(utcnow()), error, reverse_trace_id),
+            )
+
+    def read_reverse_trace(self, reverse_trace_id: int) -> dict[str, Any] | None:
+        """Atomic read of a reverse trace with its combos and invalidations."""
+        with self.connection() as conn:
+            conn.execute("BEGIN")
+            try:
+                trace = conn.execute(
+                    "SELECT * FROM reverse_traces WHERE id=?",
+                    (reverse_trace_id,),
+                ).fetchone()
+                if trace is None:
+                    return None
+                combos = conn.execute(
+                    "SELECT * FROM reverse_combos WHERE reverse_trace_id=?"
+                    " ORDER BY rank",
+                    (reverse_trace_id,),
+                ).fetchall()
+                invalidations = conn.execute(
+                    "SELECT * FROM reverse_invalidations WHERE reverse_trace_id=?"
+                    " ORDER BY invalidated_at, batch_no",
+                    (reverse_trace_id,),
+                ).fetchall()
+                pinned = json.loads(trace["pinned_json"])
+                pinned_rows = conn.execute(
+                    "SELECT batch_no, version, origin, destination, departed_at,"
+                    " arrived_at FROM batches WHERE intake_id=?"
+                    " ORDER BY batch_no",
+                    (int(trace["intake_id"]),),
+                ).fetchall()
+                return {
+                    "trace": trace,
+                    "combos": combos,
+                    "invalidations": invalidations,
+                    "pinned": pinned,
+                    "batches": [
+                        {
+                            "batch_no": row["batch_no"],
+                            "version": int(row["version"]),
+                            "origin": row["origin"],
+                            "destination": row["destination"],
+                            "departed_at": parse_iso(row["departed_at"]),
+                            "arrived_at": parse_iso(row["arrived_at"]),
+                        }
+                        for row in pinned_rows
+                        if pinned.get(row["batch_no"]) == int(row["version"])
+                    ],
+                }
+            finally:
+                conn.execute("COMMIT")
+
+    def reverse_trace(self, reverse_trace_id: int) -> sqlite3.Row | None:
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT * FROM reverse_traces WHERE id=?", (reverse_trace_id,)
+            ).fetchone()
+
+    def reverse_invalidations(self, reverse_trace_id: int) -> list[sqlite3.Row]:
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT * FROM reverse_invalidations WHERE reverse_trace_id=?"
+                " ORDER BY invalidated_at, batch_no",
+                (reverse_trace_id,),
+            ).fetchall()
+
+    def reverse_trace_history(self) -> list[sqlite3.Row]:
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT t.*,"
+                " (SELECT COUNT(*) FROM reverse_combos c"
+                "   WHERE c.reverse_trace_id=t.id) AS combo_count,"
+                " (SELECT COUNT(*) FROM reverse_invalidations i"
+                "   WHERE i.reverse_trace_id=t.id) AS invalidation_count"
+                " FROM reverse_traces t ORDER BY t.id DESC"
             ).fetchall()
 
     # ----------------------------------------------------------------- audit

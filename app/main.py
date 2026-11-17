@@ -9,6 +9,9 @@ Endpoints
 ``POST /traces``                   run a trace on a pinned snapshot
 ``GET  /traces``                    list accepted traces
 ``GET  /traces/{id}``               re-read a published snapshot result
+``POST /reverse-traces``            minimum candidate-source combinations
+``GET  /reverse-traces``            list accepted reverse traces
+``GET  /reverse-traces/{id}``       re-read a published reverse result
 ``GET  /healthz``                   readiness probe
 """
 from __future__ import annotations
@@ -22,7 +25,7 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from . import tracing
+from . import reverse, tracing
 from .schemas import (
     AffectedSample,
     BatchCorrection,
@@ -34,6 +37,12 @@ from .schemas import (
     IntakeResponse,
     InvalidationInfo,
     PathLeg,
+    ReverseCombination,
+    ReverseExplanation,
+    ReverseTraceListResponse,
+    ReverseTraceRequest,
+    ReverseTraceResponse,
+    ReverseTraceSummary,
     SnapshotInfo,
     TraceListResponse,
     TraceRequest,
@@ -83,6 +92,13 @@ def create_app(db_path: str | None = None) -> FastAPI:
             {"name": "intake", "description": "Register samples and batches."},
             {"name": "corrections", "description": "Versioned batch replacement."},
             {"name": "traces", "description": "Contamination trace snapshots."},
+            {
+                "name": "reverse-tracing",
+                "description": (
+                    "Reverse attribution: minimum candidate-source combinations"
+                    " explaining reviewed positives without touching negatives."
+                ),
+            },
         ],
     )
     app.state.store = store
@@ -405,6 +421,266 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 reason=row["reason"],
             )
             for row in store.invalidations(trace_id)
+        ]
+
+    # --------------------------------------------------------- reverse routes
+
+    def _reverse_response(bundle: Any) -> ReverseTraceResponse:
+        trace = bundle["trace"]
+        invalidations = bundle["invalidations"]
+        if trace["status"] == "complete" and not invalidations:
+            combinations = [
+                ReverseCombination(
+                    source_sample_ids=_load_json(row["source_sample_ids_json"]),
+                    explanations=[
+                        ReverseExplanation(
+                            sample_id=item["sample_id"],
+                            source_sample_id=item["source_sample_id"],
+                            first_arrival_at=(
+                                parse_iso(item["first_arrival_at"])
+                                if item["first_arrival_at"]
+                                else None
+                            ),
+                            path=[PathLeg(**leg) for leg in item["path"]],
+                        )
+                        for item in _load_json(row["explanations_json"])
+                    ],
+                )
+                for row in bundle["combos"]
+            ]
+        else:
+            # Failed and invalidated snapshots never expose combination rows.
+            combinations = []
+        details = trace["reason_details_json"]
+        return ReverseTraceResponse(
+            reverse_trace_id=int(trace["id"]),
+            status=trace["status"],
+            solvable=bool(trace["solvable"]) if trace["solvable"] is not None else False,
+            reason_code=trace["reason_code"],
+            reason=trace["reason"],
+            reason_details=_load_json(details) if details is not None else None,
+            candidate_sample_ids=_load_json(trace["candidates_json"]),
+            positive_sample_ids=_load_json(trace["positives_json"]),
+            negative_sample_ids=_load_json(trace["negatives_json"]),
+            combinations=combinations,
+            combination_count=len(combinations),
+            minimum_source_count=(
+                int(trace["minimum_source_count"])
+                if trace["minimum_source_count"] is not None
+                else None
+            ),
+            snapshot=SnapshotInfo(
+                intake_id=int(trace["intake_id"]),
+                accepted_at=parse_iso(trace["accepted_at"]),
+                batch_versions={
+                    k: int(v) for k, v in bundle["pinned"].items()
+                },
+                batches=[BatchOut(**row) for row in bundle["batches"]],
+            ),
+            error=trace["error"],
+        )
+
+    @app.post(
+        "/reverse-traces",
+        response_model=ReverseTraceResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["reverse-tracing"],
+        summary="Find minimum candidate-source combinations on a pinned snapshot",
+        responses={
+            404: {"model": ErrorBody, "description": "No dataset or unknown sample"},
+            409: {"model": ErrorBody, "description": "Snapshot became stale"},
+            500: {"model": ErrorBody, "description": "Computation failed"},
+        },
+    )
+    def run_reverse_trace(payload: ReverseTraceRequest) -> ReverseTraceResponse:
+        try:
+            reverse_trace_id, snapshot = store.accept_reverse_trace(
+                candidates=payload.candidate_sample_ids,
+                positives=payload.positive_sample_ids,
+                negatives=payload.negative_sample_ids,
+            )
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except InvalidReferenceError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        try:
+            outcome = reverse.solve(
+                samples=snapshot["samples"],
+                batches=snapshot["batches"],
+                candidate_sample_ids=payload.candidate_sample_ids,
+                positive_sample_ids=payload.positive_sample_ids,
+                negative_sample_ids=payload.negative_sample_ids,
+            )
+            store.publish_reverse_results(
+                reverse_trace_id, outcome, pinned=snapshot["pinned"]
+            )
+        except ConflictError as exc:
+            # A correction landed during computation: never publish old advice.
+            store.fail_reverse_trace(reverse_trace_id, str(exc))
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "snapshot_changed",
+                    "message": str(exc),
+                    "details": {
+                        "reverse_trace_id": reverse_trace_id,
+                        "status": "failed",
+                    },
+                },
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - recorded, never half-published
+            store.fail_reverse_trace(
+                reverse_trace_id, f"{type(exc).__name__}: {exc}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "reverse_trace_failed",
+                    "message": f"{type(exc).__name__}: {exc}",
+                    "details": {
+                        "reverse_trace_id": reverse_trace_id,
+                        "status": "failed",
+                    },
+                },
+            ) from exc
+
+        stored = store.read_reverse_trace(reverse_trace_id)
+        assert stored is not None
+        store.log(
+            "reverse_trace",
+            {
+                "reverse_trace_id": reverse_trace_id,
+                "solvable": outcome["solvable"],
+                "combinations": len(outcome["combinations"]),
+            },
+        )
+        return _reverse_response(stored)
+
+    @app.get(
+        "/reverse-traces",
+        response_model=ReverseTraceListResponse,
+        tags=["reverse-tracing"],
+        summary="List accepted reverse traces",
+    )
+    def list_reverse_traces() -> ReverseTraceListResponse:
+        rows = store.reverse_trace_history()
+        return ReverseTraceListResponse(
+            reverse_traces=[
+                ReverseTraceSummary(
+                    reverse_trace_id=int(row["id"]),
+                    status=row["status"],
+                    accepted_at=parse_iso(row["accepted_at"]),
+                    completed_at=parse_iso(row["completed_at"])
+                    if row["completed_at"]
+                    else None,
+                    candidate_sample_ids=_load_json(row["candidates_json"]),
+                    positive_sample_ids=_load_json(row["positives_json"]),
+                    negative_sample_ids=_load_json(row["negatives_json"]),
+                    solvable=bool(row["solvable"])
+                    if row["solvable"] is not None
+                    else False,
+                    combination_count=int(row["combo_count"]),
+                    minimum_source_count=(
+                        int(row["minimum_source_count"])
+                        if row["minimum_source_count"] is not None
+                        else None
+                    ),
+                    invalidated=int(row["invalidation_count"]) > 0,
+                )
+                for row in rows
+            ]
+        )
+
+    @app.get(
+        "/reverse-traces/{reverse_trace_id}",
+        response_model=ReverseTraceResponse,
+        tags=["reverse-tracing"],
+        summary="Read one pinned reverse attribution result",
+        responses={
+            404: {"model": ErrorBody, "description": "Unknown reverse trace"},
+            409: {"model": ErrorBody, "description": "Snapshot invalidated"},
+        },
+    )
+    def get_reverse_trace(reverse_trace_id: int) -> ReverseTraceResponse:
+        bundle = store.read_reverse_trace(reverse_trace_id)
+        if bundle is None:
+            raise HTTPException(
+                status_code=404, detail="reverse trace not found"
+            )
+        trace = bundle["trace"]
+        if bundle["invalidations"]:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "snapshot_invalidated",
+                    "message": (
+                        "this snapshot was invalidated by a batch correction;"
+                        " run a new reverse trace"
+                    ),
+                    "details": {
+                        "reverse_trace_id": reverse_trace_id,
+                        "invalidations": [
+                            InvalidationInfo(
+                                batch_no=row["batch_no"],
+                                version=int(row["version"]),
+                                invalidated_at=parse_iso(row["invalidated_at"]),
+                                reason=row["reason"],
+                            ).model_dump(mode="json")
+                            for row in bundle["invalidations"]
+                        ],
+                    },
+                },
+            )
+        if trace["status"] == "failed":
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "reverse_trace_failed",
+                    "message": trace["error"] or "reverse trace failed",
+                    "details": {
+                        "reverse_trace_id": reverse_trace_id,
+                        "status": "failed",
+                    },
+                },
+            )
+        if trace["status"] != "complete":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "reverse_trace_pending",
+                    "message": (
+                        "reverse trace has not been published yet; retry later"
+                    ),
+                    "details": {
+                        "reverse_trace_id": reverse_trace_id,
+                        "status": trace["status"],
+                    },
+                },
+            )
+        return _reverse_response(bundle)
+
+    @app.get(
+        "/reverse-traces/{reverse_trace_id}/invalidations",
+        response_model=list[InvalidationInfo],
+        tags=["reverse-tracing"],
+        summary="Invalidation records for a reverse trace",
+    )
+    def get_reverse_invalidations(
+        reverse_trace_id: int,
+    ) -> list[InvalidationInfo]:
+        if store.reverse_trace(reverse_trace_id) is None:
+            raise HTTPException(
+                status_code=404, detail="reverse trace not found"
+            )
+        return [
+            InvalidationInfo(
+                batch_no=row["batch_no"],
+                version=int(row["version"]),
+                invalidated_at=parse_iso(row["invalidated_at"]),
+                reason=row["reason"],
+            )
+            for row in store.reverse_invalidations(reverse_trace_id)
         ]
 
     return app

@@ -307,6 +307,74 @@ class TraceRequest(BaseModel):
         return cleaned
 
 
+class ReverseTraceRequest(BaseModel):
+    """Reverse attribution: find minimum candidate-source combinations.
+
+    Only the listed candidate samples are treated as hypothetical sources.
+    A candidate that is itself a reviewed negative can never belong to a
+    valid combination; an untested sample (neither positive nor negative)
+    imposes no constraint.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "example": {
+                "candidate_sample_ids": ["S-001", "S-002"],
+                "positive_sample_ids": ["S-003", "S-004"],
+                "negative_sample_ids": ["S-005"],
+            }
+        },
+    )
+
+    candidate_sample_ids: list[str] = Field(
+        min_length=1,
+        max_length=8,
+        description="1-8 candidate contamination source samples.",
+    )
+    positive_sample_ids: list[str] = Field(
+        min_length=1,
+        max_length=12,
+        description="1-12 reviewed positive samples that must all be explained.",
+    )
+    negative_sample_ids: list[str] = Field(
+        default_factory=list,
+        max_length=12,
+        description=(
+            "Up to 12 reviewed negative samples that no chosen combination may"
+            " reach. Samples not listed here are untested, not negative."
+        ),
+    )
+
+    @field_validator("candidate_sample_ids", "positive_sample_ids")
+    @classmethod
+    def _required_ids(cls, v: list[str], info) -> list[str]:
+        cleaned = [_clean(item, info.field_name) for item in v]
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError(f"duplicate id in {info.field_name}")
+        return cleaned
+
+    @field_validator("negative_sample_ids")
+    @classmethod
+    def _negative_ids(cls, v: list[str]) -> list[str]:
+        cleaned = [_clean(item, "negative_sample_ids") for item in v]
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("duplicate id in negative_sample_ids")
+        return cleaned
+
+    @model_validator(mode="after")
+    def _no_overlap(self) -> "ReverseTraceRequest":
+        pos = set(self.positive_sample_ids)
+        neg = set(self.negative_sample_ids)
+        overlap = sorted(pos & neg)
+        if overlap:
+            raise ValueError(
+                "a sample cannot be both positive and negative:"
+                f" {', '.join(overlap)}"
+            )
+        return self
+
+
 class PathLeg(BaseModel):
     """One shipment in the contamination path, pinned to its version."""
 
@@ -424,6 +492,80 @@ class DatasetResponse(BaseModel):
     samples: list[SampleOut]
     batches: list[BatchOut]
     source_sample_ids: list[str]
+
+
+class ReverseExplanation(BaseModel):
+    """How one positive sample is explained by a chosen combination."""
+
+    sample_id: str = Field(description="The explained positive sample.")
+    source_sample_id: str = Field(
+        description="The combination member that reaches this positive."
+    )
+    first_arrival_at: datetime | None = Field(
+        default=None,
+        description=(
+            "Earliest contaminated arrival with the sample. Null when the"
+            " sample is itself an assumed source (its path is then empty)."
+        ),
+    )
+    path: list[PathLeg] = Field(
+        default_factory=list,
+        description="Batch chain from the chosen source; empty for self-explanation.",
+    )
+
+
+class ReverseCombination(BaseModel):
+    """One minimum-size valid candidate-source combination."""
+
+    source_sample_ids: list[str] = Field(
+        description="Assumed source samples making up this combination."
+    )
+    explanations: list[ReverseExplanation] = Field(
+        description="One explanation per requested positive, in request order."
+    )
+
+
+class ReverseTraceResponse(BaseModel):
+    reverse_trace_id: int
+    status: str
+    solvable: bool
+    reason_code: str | None = Field(
+        default=None,
+        description=(
+            "all_candidate_sources_are_negative | unexplained_positive_samples"
+            " | all_combinations_touch_negative"
+        ),
+    )
+    reason: str | None = None
+    reason_details: dict[str, Any] | None = None
+    candidate_sample_ids: list[str]
+    positive_sample_ids: list[str]
+    negative_sample_ids: list[str]
+    combinations: list[ReverseCombination]
+    combination_count: int
+    minimum_source_count: int | None = Field(
+        default=None, description="Size of every returned combination; null if unsolvable."
+    )
+    snapshot: SnapshotInfo
+    error: str | None = None
+
+
+class ReverseTraceSummary(BaseModel):
+    reverse_trace_id: int
+    status: str
+    accepted_at: datetime
+    completed_at: datetime | None = None
+    candidate_sample_ids: list[str]
+    positive_sample_ids: list[str]
+    negative_sample_ids: list[str]
+    solvable: bool
+    combination_count: int
+    minimum_source_count: int | None = None
+    invalidated: bool
+
+
+class ReverseTraceListResponse(BaseModel):
+    reverse_traces: list[ReverseTraceSummary]
 
 
 class ErrorBody(BaseModel):
